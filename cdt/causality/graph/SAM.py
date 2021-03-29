@@ -193,7 +193,8 @@ def run_SAM(in_data, skeleton=None, is_mixed=False, device="cpu",
             dagstart=0, dagloss=False,
             dagpenalization=0.05, dagpenalization_increase=0.0,
             categorical_threshold=50,
-            linear=False, numberHiddenLayersG=2, numberHiddenLayersD=2, idx=0):
+            linear=False, numberHiddenLayersG=2, numberHiddenLayersD=2, idx=0, 
+            optimizer_type="Adam", n_discr=1, resample=False):
 
     list_nodes = list(in_data.columns)
     if is_mixed:
@@ -230,13 +231,16 @@ def run_SAM(in_data, skeleton=None, is_mixed=False, device="cpu",
                          cat_sizes=cat_sizes, linear=linear, numberHiddenLayersG=numberHiddenLayersG).to(device)
 
     sam.reset_parameters()
-    g_optimizer = th.optim.Adam(list(sam.parameters()), lr=lr_gen)
+
+    optimizer_class = getattr(th.optim, optimizer_type)
+
+    g_optimizer = optimizer_class(list(sam.parameters()), lr=lr_gen)
 
     if losstype != "mse":
         discriminator = SAM_discriminator(cols, dnh, numberHiddenLayersD,
                                           mask=sam.categorical_matrix,).to(device)
         discriminator.reset_parameters()
-        d_optimizer = th.optim.Adam(discriminator.parameters(), lr=lr_disc)
+        d_optimizer = optimizer_class(discriminator.parameters(), lr=lr_disc)
         criterion = th.nn.BCEWithLogitsLoss()
     else:
         criterion = th.nn.MSELoss()
@@ -254,11 +258,11 @@ def run_SAM(in_data, skeleton=None, is_mixed=False, device="cpu",
 
     graph_sampler.weights.data.fill_(2)
 
-    graph_optimizer = th.optim.Adam(graph_sampler.parameters(), lr=lr_gen)
+    graph_optimizer = optimizer_class(graph_sampler.parameters(), lr=lr_gen)
 
     if not linear and functionalComplexity=="n_hidden_units":
         neuron_sampler = MatrixSampler((nh, len(list_nodes)), mask=False, gumble=True).to(device)
-        neuron_optimizer = th.optim.Adam(list(neuron_sampler.parameters()),lr=lr_gen)
+        neuron_optimizer = optimizer_class(list(neuron_sampler.parameters()),lr=lr_gen)
 
     _true = th.ones(1).to(device)
     _false = th.zeros(1).to(device)
@@ -285,29 +289,39 @@ def run_SAM(in_data, skeleton=None, is_mixed=False, device="cpu",
             if not linear and functionalComplexity=="n_hidden_units":
                 drawn_neurons = neuron_sampler()
 
+            def generate_vars():
+                if linear or functionalComplexity!="n_hidden_units":
+                    generated_variables = sam(batch, drawn_graph)
+                else:
+                    generated_variables = sam(batch, drawn_graph, drawn_neurons)
+                return generated_variables
+            
+            if not resample:
+                generated_variables = generate_vars()
+            for i_discr in range(n_discr):
+                if resample:
+                    generated_variables = generate_vars()
+                if losstype != "mse":
+                    disc_vars_d = discriminator(generated_variables.detach(), batch)
+                    true_vars_disc = discriminator(batch)
 
-            if linear or functionalComplexity!="n_hidden_units":
-                generated_variables = sam(batch, drawn_graph)
-            else:
-                generated_variables = sam(batch, drawn_graph, drawn_neurons)
+                    if losstype == "gan":
+                        disc_loss = sum([criterion(gen, _false.expand_as(gen)) for gen in disc_vars_d]) / nb_var \
+                                        + criterion(true_vars_disc, _true.expand_as(true_vars_disc))
+                        # Gen Losses per generator: multiply py the number of channels
+                    elif losstype == "fgan":
+                        disc_loss = th.mean(th.exp(disc_vars_d - 1), [0, 2]).sum() / nb_var - th.mean(true_vars_disc)
+                    elif losstype == "wgan":
+                        disc_loss = th.mean(true_vars_disc - disc_vars_d)
 
-            if losstype != "mse":
-                disc_vars_d = discriminator(generated_variables.detach(), batch)
-                true_vars_disc = discriminator(batch)
-
-                if losstype == "gan":
-                    disc_loss = sum([criterion(gen, _false.expand_as(gen)) for gen in disc_vars_d]) / nb_var \
-                                     + criterion(true_vars_disc, _true.expand_as(true_vars_disc))
-                    # Gen Losses per generator: multiply py the number of channels
-                elif losstype == "fgan":
-
-                    disc_loss = th.mean(th.exp(disc_vars_d - 1), [0, 2]).sum() / nb_var - th.mean(true_vars_disc)
-
-                disc_loss.backward()
-                d_optimizer.step()
+                    disc_loss.backward()
+                    d_optimizer.step()
 
 
             ### OPTIMIZING THE GENERATORS
+            if resample:
+                generated_variables = generate_vars()
+
             g_optimizer.zero_grad()
             graph_optimizer.zero_grad()
 
@@ -326,6 +340,8 @@ def run_SAM(in_data, skeleton=None, is_mixed=False, device="cpu",
                                     for gen in disc_vars_g])
                 elif losstype == "fgan":
                     gen_loss = -th.mean(th.exp(disc_vars_g - 1), [0, 2]).sum()
+                elif losstype == "wgan":
+                    gen_loss = -th.mean(disc_vars_g)
 
             filters = graph_sampler.get_proba()
             struc_loss = lambda1*drawn_graph.sum()
