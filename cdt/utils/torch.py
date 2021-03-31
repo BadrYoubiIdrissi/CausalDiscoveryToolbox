@@ -58,7 +58,7 @@ def _gumbel_softmax_sample(logits, tau=1, eps=1e-10):
     (MIT license)
     """
     dims = logits.dim()
-    gumbel_noise = _sample_gumbel(logits.size(), eps=eps, out=logits.data.new())
+    gumbel_noise = _sample_gumbel(logits.size(), eps=eps, out=logits.detach().new())
     y = logits + gumbel_noise
     return th.softmax(y / tau, dims-1)
 
@@ -86,16 +86,16 @@ def gumbel_softmax(logits, tau=1, hard=False, eps=1e-10):
     assert len(shape) == 2
     y_soft = _gumbel_softmax_sample(logits, tau=tau, eps=eps)
     if hard:
-        _, k = y_soft.data.max(-1)
+        _, k = y_soft.detach().max(-1)
         # this bit is based on
         # https://discuss.pytorch.org/t/stop-gradients-for-st-gumbel-softmax/530/5
-        y_hard = logits.data.new(*shape).zero_().scatter_(-1, k.view(-1, 1), 1.0)
+        y_hard = logits.detach().new(*shape).zero_().scatter_(-1, k.view(-1, 1), 1.0)
         # this cool bit of code achieves two things:
         # - makes the output value exactly one-hot (since we add then
         #   subtract y_soft value)
         # - makes the gradient equal to y_soft gradient (since we strip
         #   all other gradients)
-        y = y_hard - y_soft.data + y_soft
+        y = y_hard - y_soft.detach() + y_soft
     else:
         y = y_soft
     return y
@@ -113,7 +113,7 @@ def _sigmoid_sample(logits, tau=1):
     Implementation of Bernouilli reparametrization based on Maddison et al. 2017
     """
     dims = logits.dim()
-    logistic_noise = _sample_logistic(logits.size(), out=logits.data.new())
+    logistic_noise = _sample_logistic(logits.size(), out=logits.detach().new())
     y = logits + logistic_noise
     return th.sigmoid(y / tau)
 
@@ -125,7 +125,7 @@ def gumbel_sigmoid(logits, ones_tensor, zeros_tensor, tau=1, hard=False):
 
     if hard:
         y_hard = th.where(y_soft > 0.5, ones_tensor, zeros_tensor)
-        y = y_hard.data - y_soft.data + y_soft
+        y = y_hard.detach() - y_soft.detach() + y_soft
     else:
     	y = y_soft
     return y
@@ -450,7 +450,7 @@ class GraphSampler(th.nn.Module):
         #print(sample_soft* self.mask)
         #print(sample_hard* self.mask)
 
-        sample = sample_hard - sample_soft.data + sample_soft
+        sample = sample_hard - sample_soft.detach() + sample_soft
 
         return sample * self.mask
 
@@ -584,7 +584,7 @@ class MatrixSampler3(th.nn.Module):
             sample_soft = th.sigmoid(corr_weights)
             sample_hard = th.where(corr_weights > 0,
                                    self.ones_tensor, self.zeros_tensor)
-            out_sample = sample_hard - sample_soft.data + sample_soft
+            out_sample = sample_hard - sample_soft.detach() + sample_soft
 
         if hasattr(self, "mask"):
             return self.mask * out_sample
@@ -630,7 +630,7 @@ class SimpleMatrixConnection(th.nn.Module):
         sample_soft = th.sigmoid(2 * self.weights)
 
         sample_hard = th.where(self.weights > 0, self.ones_tensor, self.zeros_tensor)
-        sample = sample_hard - sample_soft.data + sample_soft
+        sample = sample_hard - sample_soft.detach() + sample_soft
 
         if hasattr(self, "mask"):
             return self.mask * sample_soft

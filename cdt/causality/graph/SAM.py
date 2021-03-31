@@ -270,12 +270,12 @@ def run_SAM(in_data, skeleton=None, is_mixed=False, device="cpu",
 
     data_iterator = DataLoader(data, batch_size=batch_size, shuffle=True, drop_last=True)
 
-
     # RUN
     if verbose:
         pbar = tqdm(range(train + test))
     else:
         pbar = range(train+test)
+
     for epoch in pbar:
         for i_batch, batch in enumerate(data_iterator):
 
@@ -302,7 +302,10 @@ def run_SAM(in_data, skeleton=None, is_mixed=False, device="cpu",
                 if resample:
                     generated_variables = generate_vars()
                 if losstype != "mse":
-                    disc_vars_d = discriminator(generated_variables.detach(), batch)
+                    if losstype == "wgan":
+                        disc_vars_d = discriminator(generated_variables.detach())
+                    else:
+                        disc_vars_d = discriminator(generated_variables.detach(), batch)
                     true_vars_disc = discriminator(batch)
 
                     if losstype == "gan":
@@ -312,10 +315,14 @@ def run_SAM(in_data, skeleton=None, is_mixed=False, device="cpu",
                     elif losstype == "fgan":
                         disc_loss = th.mean(th.exp(disc_vars_d - 1), [0, 2]).sum() / nb_var - th.mean(true_vars_disc)
                     elif losstype == "wgan":
-                        disc_loss = th.mean(true_vars_disc - disc_vars_d)
+                        disc_loss = th.mean(disc_vars_d-true_vars_disc)
 
                     disc_loss.backward()
                     d_optimizer.step()
+                    if losstype == "wgan":
+                        with th.no_grad():
+                            for parameter in discriminator.parameters():
+                                parameter.clip_(-10, 10)
 
 
             ### OPTIMIZING THE GENERATORS
@@ -331,12 +338,15 @@ def run_SAM(in_data, skeleton=None, is_mixed=False, device="cpu",
             if losstype == "mse":
                 gen_loss = criterion(generated_variables, batch)
             else:
-                disc_vars_g = discriminator(generated_variables, batch)
+                if losstype == "wgan":
+                    disc_vars_g = discriminator(generated_variables)
+                else:
+                    disc_vars_g = discriminator(generated_variables, batch)
 
                 if losstype == "gan":
                     # Gen Losses per generator: multiply py the number of channels
                     gen_loss = sum([criterion(gen,
-                                              _true.expand_as(gen))
+                                            _true.expand_as(gen))
                                     for gen in disc_vars_g])
                 elif losstype == "fgan":
                     gen_loss = -th.mean(th.exp(disc_vars_g - 1), [0, 2]).sum()
@@ -374,22 +384,22 @@ def run_SAM(in_data, skeleton=None, is_mixed=False, device="cpu",
                 loss = gen_loss + regul_loss
             if verbose and epoch % 20 == 0 and i_batch == 0:
                 pbar.set_postfix(gen=gen_loss.item()/cols,
-                                 disc=disc_loss.item(),
-                                 regul_loss=regul_loss.item(),
-                                 tot=loss.item())
+                                disc=disc_loss.item(),
+                                regul_loss=regul_loss.item(),
+                                tot=loss.item())
 
             if epoch < train + test - 1:
                 loss.backward()
 
             if epoch >= train:
-                output.add_(filters.data)
+                output.add_(filters.detach())
 
             g_optimizer.step()
             graph_optimizer.step()
             if not linear and functionalComplexity=="n_hidden_units":
                 neuron_optimizer.step()
 
-    return output.div_(test).cpu().numpy()
+    return output.div_(test).cpu().numpy(), generated_variables.detach().cpu().numpy()
     # Evaluate total effect with final DAG
 
 
@@ -481,7 +491,7 @@ class SAM(GraphModel):
                  dagpenalization_increase=0.01,
                  functional_complexity='l2_norm', hlayers=2, dhlayers=2,
                  sampling_type='sigmoidproba', linear=False, nruns=8,
-                 njobs=None, gpus=None, verbose=None):
+                 njobs=None, gpus=None, verbose=None,optimizer_type="Adam", n_discr=1, resample=False):
 
         """Init and parametrize the SAM model."""
         super(SAM, self).__init__()
@@ -509,6 +519,9 @@ class SAM(GraphModel):
         self.gpus = SETTINGS.get_default(gpu=gpus)
         self.verbose = SETTINGS.get_default(verbose=verbose)
         self.nruns = nruns
+        self.optimizer_type=optimizer_type
+        self.n_discr=n_discr
+        self.resample=resample
 
     def predict(self, data, graph=None,
                 return_list_results=False):
@@ -547,6 +560,9 @@ class SAM(GraphModel):
                                linear=self.linear,
                                numberHiddenLayersD=self.numberHiddenLayersD,
                                numberHiddenLayersG=self.numberHiddenLayersG,
+                               optimizer_type=self.optimizer_type, 
+                               n_discr=self.n_discr, 
+                               resample=self.resample,
                                device='cpu') for i in range(self.nruns)]
         else:
             results = parallel_run(run_SAM, data, skeleton=skeleton,
@@ -567,17 +583,15 @@ class SAM(GraphModel):
                                    sampletype=self.sampletype,
                                    linear=self.linear,
                                    numberHiddenLayersD=self.numberHiddenLayersD,
-                                   numberHiddenLayersG=self.numberHiddenLayersG)
-        list_out = [i for i in results if not np.isnan(i).any()]
-        try:
-            assert len(list_out) > 0
-        except AssertionError as e:
-            print("All solutions contain NaNs")
-            raise(e)
-        W = sum(list_out)/len(list_out)
-        return nx.relabel_nodes(nx.DiGraph(W),
-                                {idx: i for idx,
-                                 i in enumerate(data.columns)})
+                                   numberHiddenLayersG=self.numberHiddenLayersG,
+                                   optimizer_type=self.optimizer_type, 
+                                   n_discr=self.n_discr, 
+                                   resample=self.resample,)
+        graphs, out = zip(*results)
+        return np.stack(graphs), np.stack(out)
+        # return nx.relabel_nodes(nx.DiGraph(W>0.9),
+        #                         {idx: i for idx,
+        #                          i in enumerate(data.columns)})
 
     def orient_directed_graph(self, *args, **kwargs):
         """Orient a (partially directed) graph."""
